@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>手势控制粒子星球 - 部署就绪版</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        canvas { display: block; }
+        
+        #ui-container {
+            position: absolute;
+            top: env(safe-area-inset-top, 20px);
+            left: 20px;
+            color: white;
+            pointer-events: none;
+            text-shadow: 0 0 8px rgba(0,0,0,0.9);
+            z-index: 10;
+        }
+        .status { font-size: 14px; margin-bottom: 5px; opacity: 0.9; color: #00ffcc; }
+        .gesture-hint { font-size: 20px; font-weight: bold; color: #ffa500; }
+        
+        /* 启动与环境检测界面 */
+        #overlay-start {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: radial-gradient(circle at center, #1a1a1a 0%, #000 100%);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            color: #ffa500;
+            z-index: 200;
+            text-align: center;
+            padding: 20px;
+        }
+        .start-btn {
+            padding: 18px 50px;
+            border: 2px solid #ffa500;
+            border-radius: 40px;
+            font-size: 22px;
+            font-weight: bold;
+            background: rgba(255, 165, 0, 0.1);
+            color: #ffa500;
+            margin-bottom: 25px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .start-btn:active { transform: scale(0.95); background: rgba(255, 165, 0, 0.3); }
+
+        /* 警告信息样式 */
+        #protocol-warning {
+            color: #ff4444;
+            font-size: 13px;
+            background: rgba(255,0,0,0.1);
+            padding: 10px 15px;
+            border-radius: 8px;
+            margin-top: 20px;
+            max-width: 300px;
+            display: none;
+        }
+
+        /* 视频容器 */
+        #video-container {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            width: 140px;
+            height: 105px;
+            border: 2px solid rgba(255,165,0,0.4);
+            border-radius: 12px;
+            overflow: hidden;
+            background: #111;
+            transform: scaleX(-1);
+            z-index: 5;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+        }
+        video#input_video { width: 100%; height: 100%; object-fit: cover; }
+
+        #camera-error-toast {
+            position: fixed;
+            bottom: 140px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(20, 20, 20, 0.95);
+            border: 1px solid #ff4444;
+            color: white;
+            padding: 12px 24px;
+            border-radius: 30px;
+            font-size: 13px;
+            display: none;
+            z-index: 110;
+            text-align: center;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+        }
+    </style>
+    <!-- 引入核心库 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="overlay-start">
+        <div class="start-btn" onclick="initApp()">开启绚烂星球系统</div>
+        <p style="font-size: 15px; opacity: 0.8;">系统需要摄像头权限以实现手势控制</p>
+        
+        <div id="protocol-warning">
+            ⚠️ 检测到非 HTTPS 环境<br>
+            iOS/移动端浏览器将无法开启摄像头。<br>
+            请部署至 GitHub Pages 或开启 HTTPS。
+        </div>
+    </div>
+
+    <div id="camera-error-toast"></div>
+
+    <div id="ui-container">
+        <div class="status">AI NEBULA INTERACTIVE</div>
+        <div id="current-gesture" class="gesture-hint">等待手势识别...</div>
+        <div style="margin-top: 15px; font-size: 12px; line-height: 1.8; opacity: 0.7;">
+            <b style="color: #00ffcc;">手势指令：</b><br>
+            • 旋转手掌：同步旋转视角<br>
+            • 握拳向后：快速远离星球 (先慢后快)<br>
+            • 张开向前：快速靠近星球 (先快后慢)
+        </div>
+    </div>
+
+    <div id="video-container">
+        <video id="input_video" autoplay muted playsinline></video>
+    </div>
+
+    <script>
+        // 检测协议并提醒
+        if (window.location.protocol !== 'https:' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+            document.getElementById('protocol-warning').style.display = 'block';
+        }
+
+        let scene, camera, renderer, planetParticles, ring1, ring2;
+        let clock = new THREE.Clock();
+        let appStarted = false;
+
+        const interaction = {
+            targetRadius: 400,
+            currentRadius: 1500, // 从远处入场
+            targetRotationY: 0,
+            currentRotationY: 0,
+            minRadius: 160,
+            maxRadius: 1800,
+            isMouseDown: false
+        };
+
+        function setupThree() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 1, 5000);
+            
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            document.body.appendChild(renderer.domElement);
+
+            const sprite = createCircleTexture();
+
+            // 1. 橙色星球粒子
+            const planetCount = 22000;
+            const planetGeo = new THREE.BufferGeometry();
+            const positions = new Float32Array(planetCount * 3);
+            const colors = new Float32Array(planetCount * 3);
+            const colorCore = new THREE.Color(0xff5500); 
+            const colorSurface = new THREE.Color(0xffcc00);
+
+            for (let i = 0; i < planetCount; i++) {
+                const phi = Math.acos(-1 + (2 * i) / planetCount);
+                const theta = Math.sqrt(planetCount * Math.PI) * phi;
+                
+                // 模拟星球：在半径 100 附近高度聚集
+                const r = 100 + (Math.random() - 0.5) * 8; 
+                
+                positions[i * 3] = r * Math.cos(theta) * Math.sin(phi);
+                positions[i * 3 + 1] = r * Math.sin(theta) * Math.sin(phi);
+                positions[i * 3 + 2] = r * Math.cos(phi);
+
+                const mixed = colorCore.clone().lerp(colorSurface, Math.random());
+                colors[i * 3] = mixed.r;
+                colors[i * 3 + 1] = mixed.g;
+                colors[i * 3 + 2] = mixed.b;
+            }
+            planetGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            planetGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+            planetParticles = new THREE.Points(planetGeo, new THREE.PointsMaterial({
+                size: 4.8, 
+                map: sprite, 
+                vertexColors: true, 
+                transparent: true, 
+                blending: THREE.AdditiveBlending, 
+                depthWrite: false
+            }));
+            scene.add(planetParticles);
+
+            // 2. 双层星环
+            ring1 = createRing(170, 260, 6000, 0xffffff, 0.2);
+            ring2 = createRing(280, 360, 4500, 0xaaaaaa, 0.15);
+            scene.add(ring1);
+            scene.add(ring2);
+
+            // 备用交互 (鼠标/触屏)
+            window.addEventListener('mousedown', () => interaction.isMouseDown = true);
+            window.addEventListener('mouseup', () => interaction.isMouseDown = false);
+            window.addEventListener('mousemove', (e) => {
+                if (interaction.isMouseDown) interaction.targetRotationY += e.movementX * 0.005;
+            });
+            window.addEventListener('wheel', (e) => {
+                interaction.targetRadius = Math.max(interaction.minRadius, Math.min(interaction.maxRadius, interaction.targetRadius + e.deltaY * 0.6));
+            });
+
+            window.addEventListener('resize', onWindowResize);
+            animate();
+        }
+
+        function createRing(inner, outer, count, colorHex, tilt) {
+            const geo = new THREE.BufferGeometry();
+            const pos = new Float32Array(count * 3);
+            for (let i = 0; i < count; i++) {
+                const angle = Math.random() * Math.PI * 2;
+                const r = inner + Math.random() * (outer - inner);
+                pos[i * 3] = Math.cos(angle) * r;
+                pos[i * 3 + 1] = (Math.random() - 0.5) * 20; // 环厚度
+                pos[i * 3 + 2] = Math.sin(angle) * r;
+            }
+            geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+            const ring = new THREE.Points(geo, new THREE.PointsMaterial({
+                size: 2.5, color: colorHex, map: createCircleTexture(), transparent: true, opacity: 0.5, blending: THREE.AdditiveBlending, depthWrite: false
+            }));
+            ring.rotation.x = Math.PI * tilt;
+            return ring;
+        }
+
+        function createCircleTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 64; canvas.height = 64;
+            const ctx = canvas.getContext('2d');
+            const grad = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+            grad.addColorStop(0, 'rgba(255,255,255,1)');
+            grad.addColorStop(0.3, 'rgba(255,255,255,0.4)');
+            grad.addColorStop(1, 'rgba(255,255,255,0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, 64, 64);
+            return new THREE.CanvasTexture(canvas);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            // 缓动动画
+            interaction.currentRadius += (interaction.targetRadius - interaction.currentRadius) * 0.04;
+            interaction.currentRotationY += (interaction.targetRotationY - interaction.currentRotationY) * 0.08;
+
+            planetParticles.rotation.y += 0.001;
+            ring1.rotation.y -= 0.0015;
+            ring2.rotation.y += 0.0008;
+
+            camera.position.x = Math.sin(interaction.currentRotationY) * interaction.currentRadius;
+            camera.position.z = Math.cos(interaction.currentRotationY) * interaction.currentRadius;
+            camera.lookAt(0, 0, 0);
+
+            renderer.render(scene, camera);
+        }
+
+        // --- MediaPipe 手势逻辑 ---
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6
+        });
+
+        let lastHandSize = null;
+        hands.onResults((results) => {
+            const gestureText = document.getElementById('current-gesture');
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                const wrist = landmarks[0];
+                const middle = landmarks[9];
+                
+                // 1. 旋转计算
+                const angle = Math.atan2(middle.y - wrist.y, middle.x - wrist.x) + Math.PI/2;
+                interaction.targetRotationY -= (angle * 0.045);
+
+                // 2. 缩放逻辑
+                const palmCenter = landmarks[9];
+                let isFist = true;
+                [8, 12, 16, 20].forEach(idx => {
+                    const dist = Math.hypot(landmarks[idx].x - palmCenter.x, landmarks[idx].y - palmCenter.y);
+                    if (dist > 0.12) isFist = false; // 有手指伸出则不是握拳
+                });
+
+                const handSize = Math.hypot(landmarks[0].x - landmarks[5].x, landmarks[0].y - landmarks[5].y);
+                if (lastHandSize !== null) {
+                    const delta = handSize - lastHandSize;
+                    if (isFist) {
+                        gestureText.innerText = "✊ 握拳：快速远离星球";
+                        if (delta < -0.001) interaction.targetRadius += Math.pow(Math.abs(delta) * 650, 1.6) * 22;
+                    } else {
+                        gestureText.innerText = "✋ 张开：快速靠近星球";
+                        if (delta > 0.001) interaction.targetRadius -= Math.sqrt(delta * 700) * 32;
+                    }
+                }
+                lastHandSize = handSize;
+                // 边界限制
+                interaction.targetRadius = Math.max(interaction.minRadius, Math.min(interaction.maxRadius, interaction.targetRadius));
+            } else {
+                gestureText.innerText = "等待识别手势...";
+                lastHandSize = null;
+            }
+        });
+
+        async function initApp() {
+            if (appStarted) return;
+            appStarted = true;
+            
+            document.getElementById('overlay-start').style.opacity = '0';
+            setTimeout(() => document.getElementById('overlay-start').style.display = 'none', 500);
+
+            setupThree();
+
+            try {
+                const videoElement = document.getElementById('input_video');
+                const cameraProvider = new Camera(videoElement, {
+                    onFrame: async () => { await hands.send({image: videoElement}); },
+                    width: 640, height: 480
+                });
+                await cameraProvider.start();
+            } catch (err) {
+                console.error("Camera Init Failed:", err);
+                const toast = document.getElementById('camera-error-toast');
+                toast.style.display = 'block';
+                toast.innerHTML = `⚠️ 手势系统启动失败<br><small>${err.name === 'NotAllowedError' ? '请在浏览器设置中开启权限' : '请确保使用 HTTPS 链接访问'}</small>`;
+                document.getElementById('current-gesture').innerText = "手势不可用 (仅鼠标控制)";
+            }
+        }
+    </script>
+</body>
+</html>
